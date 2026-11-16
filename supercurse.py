@@ -9,10 +9,8 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import logging
-import os
 import queue
 import re
-import sys
 import threading
 import time
 import tkinter as tk
@@ -22,7 +20,7 @@ from pathlib import Path
 import uiautomation as auto  # sets per-monitor DPI awareness on import, so every coordinate below is in physical pixels
 import comtypes.client
 import pystray
-from PIL import Image, ImageDraw, ImageGrab
+from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
@@ -379,33 +377,80 @@ def parse_hotkey(combo):
     return mods, vk
 
 
+# ---------- look ----------
+
+BG, PANEL, LINE = "#0f1117", "#1a1e29", "#2b3040"
+FG, MUTED = "#ece8e1", "#8b93a7"
+ACCENT, ACCENT_HI = "#ff4655", "#ff6b77"
+TITLE_FONT = ("Bahnschrift SemiBold", 24)  # Bahnschrift ships with Windows 10/11
+HEAD_FONT = ("Bahnschrift SemiBold", 10)
+BODY_FONT = ("Segoe UI", 10)
+
+
+def tray_image():
+    """Neon cursor with sound waves on a dark tile. Drawn at 256 px and scaled down so the edges stay smooth."""
+    img = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((8, 8, 248, 248), radius=60, fill=BG, outline=ACCENT, width=12)
+    d.polygon([(62, 48), (62, 212), (102, 174), (128, 226), (156, 214), (130, 162), (186, 162)], fill=ACCENT)
+    for r in (34, 64):  # sound waves
+        d.arc((150 - r, 106 - r, 150 + r, 106 + r), start=-80, end=-10, fill=FG, width=16)
+    return img.resize((64, 64), Image.LANCZOS)
+
+
+def dark_title_bar(win):
+    """Windows 11: make the title bar match the dark window. Older Windows ignores it."""
+    hwnd = int(win.wm_frame(), 16)
+    for attr, value in ((20, 1), (35, 0x0017110F)):  # DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_CAPTION_COLOR = BG as 0xBBGGRR
+        v = ctypes.c_int(value)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), 4)
+
+
+def button(parent, text, command, primary=False):
+    bg, hover = (ACCENT, ACCENT_HI) if primary else (PANEL, LINE)
+    b = tk.Button(parent, text=text, command=command, font=HEAD_FONT, bg=bg, fg=FG, activebackground=hover,
+                  activeforeground=FG, relief="flat", bd=0, padx=18, pady=7, cursor="hand2", highlightthickness=0)
+    b.bind("<Enter>", lambda e: b.config(bg=hover))
+    b.bind("<Leave>", lambda e: b.config(bg=bg))
+    return b
+
+
 # ---------- app ----------
+
+HOTKEY_JOBS = {1: "selection", 2: "hover"}  # RegisterHotKey id -> job; the config key is f"{job}_hotkey"
+WM_RELOAD_HOTKEYS = 0x8001  # WM_APP + 1, posted to the hotkey thread after Settings changes a hotkey
+
 
 class App:
     def __init__(self):
+        self.first_run = not CONFIG_PATH.exists()
         self.cfg = load_config()
-        save_config(self.cfg)  # so the settings file always exists to open from the tray
+        save_config(self.cfg)
         self.jobs = queue.Queue()
         self.ui = queue.Queue()
         self.root = tk.Tk()
         self.root.withdraw()
         self.overlay = Overlay(self.root)
+        self.settings = None
+        self.hotkey_thread = None
         self.icon = pystray.Icon("SUPERCURSE", tray_image(), self.tooltip(), self.menu())
 
     def tooltip(self):
-        return (f"SUPERCURSE\n{self.cfg['selection_hotkey'].title()}: read selection\n"
-                f"{self.cfg['hover_hotkey'].title()}: read under mouse ({self.cfg['hover_unit']})")
+        return (f"SUPERCURSE\n{self.cfg['selection_hotkey'].upper()}: read selection\n"
+                f"{self.cfg['hover_hotkey'].upper()}: read under mouse ({self.cfg['hover_unit']})")
 
     def menu(self):
         def unit_item(unit):
             return pystray.MenuItem(unit.title(), lambda icon, item: self.set("hover_unit", unit),
                                     checked=lambda item: self.cfg["hover_unit"] == unit, radio=True)
         return pystray.Menu(
+            pystray.MenuItem("Settings…", lambda icon, item: self.ui.put(("settings",)), default=True),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Read under mouse", pystray.Menu(*map(unit_item, UNITS))),
             pystray.MenuItem("Highlight what is read", lambda icon, item: self.set("highlight", not self.cfg["highlight"]),
                              checked=lambda item: self.cfg["highlight"]),
             pystray.MenuItem("Stop speaking", lambda icon, item: self.jobs.put("stop")),
-            pystray.MenuItem("Open settings file", lambda icon, item: os.startfile(CONFIG_PATH)),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda icon, item: self.quit()),
         )
 
@@ -418,20 +463,38 @@ class App:
         self.icon.stop()
         self.ui.put(("quit",))
 
-    def hotkeys(self):
-        bindings = {1: ("selection", self.cfg["selection_hotkey"]), 2: ("hover", self.cfg["hover_hotkey"])}
-        for hotkey_id, (job, combo) in bindings.items():
+    def on_tray_ready(self, icon):
+        icon.visible = True
+        if self.first_run:
+            icon.notify(f"{self.cfg['selection_hotkey'].upper()}  reads selected text\n"
+                        f"{self.cfg['hover_hotkey'].upper()}  reads what's under the mouse\n"
+                        "Click the tray icon for settings.", "SUPERCURSE is running")
+
+    def register_hotkeys(self):
+        for hotkey_id, job in HOTKEY_JOBS.items():
+            user32.UnregisterHotKey(None, hotkey_id)
+            combo = self.cfg[f"{job}_hotkey"]
             try:
                 ok = user32.RegisterHotKey(None, hotkey_id, *parse_hotkey(combo))
             except ValueError as e:
                 ok, combo = False, f"{combo} ({e})"
             if not ok:
                 log.warning("could not register hotkey %s", combo)
-                self.icon.notify(f"Could not use the hotkey {combo}. Another program may be using it. "
-                                 f"Change it in the settings file and restart.", "SUPERCURSE")
+                self.icon.notify(f"Can't use {combo.upper()}, another program has it. Pick a different one in Settings.",
+                                 "SUPERCURSE")
+
+    def reload_hotkeys(self):
+        if self.hotkey_thread:
+            user32.PostThreadMessageW(self.hotkey_thread, WM_RELOAD_HOTKEYS, 0, 0)
+
+    def hotkeys(self):
+        self.hotkey_thread = kernel32.GetCurrentThreadId()
+        self.register_hotkeys()
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == 0x0312:  # WM_HOTKEY
+            if msg.message == WM_RELOAD_HOTKEYS:
+                self.register_hotkeys()
+            elif msg.message == 0x0312:  # WM_HOTKEY
                 # Windows swallows the hotkey's letter, so the app would see Alt pressed and released alone and open
                 # its menu (Notepad moves focus to "File", breaking Ctrl+C). Tapping Ctrl while Alt is still held
                 # prevents that; WinUI apps ignore the usual unassigned "mask" key, so it has to be a real key.
@@ -439,13 +502,17 @@ class App:
                     ctrl_held = user32.GetAsyncKeyState(0x11) & 0x8000
                     for flags in ((2, 0) if ctrl_held else (0, 2)):  # leave Ctrl as it was: up+down or down+up
                         user32.keybd_event(0x11, 0, flags, 0)
-                self.jobs.put(bindings[msg.wParam][0])
+                self.jobs.put(HOTKEY_JOBS[msg.wParam])
 
     def worker(self):
         with auto.UIAutomationInitializerInThread():
             voice = comtypes.client.CreateObject("SAPI.SpVoice")
             while True:
                 job = self.jobs.get()
+                if isinstance(job, tuple):  # ("say", text, rate) from the Settings "Test voice" button
+                    voice.Rate = job[2]
+                    voice.Speak(job[1], 1 | 2 | 16)
+                    continue
                 if job == "stop" or voice.Status.RunningState == 2:  # 2 = speaking: either hotkey stops speech
                     voice.Speak("", 3)  # async + purge = stop
                     log.info("stopped speaking")
@@ -472,12 +539,22 @@ class App:
                     log.info("nothing found (%s)", job)
                     nothing_found()
 
+    def open_settings(self):
+        if self.settings:
+            self.settings.win.deiconify()
+        else:
+            self.settings = Settings(self)
+        self.settings.win.lift()
+        self.settings.win.focus_force()
+
     def poll_ui(self):
         try:
             while True:
                 msg = self.ui.get_nowait()
                 if msg[0] == "highlight":
                     self.overlay.show(msg[1])
+                elif msg[0] == "settings":
+                    self.open_settings()
                 elif msg[0] == "quit":
                     self.root.destroy()
                     return
@@ -486,21 +563,132 @@ class App:
         self.root.after(50, self.poll_ui)
 
     def run(self):
-        self.icon.run_detached()
+        self.icon.run_detached(setup=self.on_tray_ready)
         threading.Thread(target=self.worker, daemon=True).start()
         threading.Thread(target=self.hotkeys, daemon=True).start()
         self.poll_ui()
         self.root.mainloop()
 
 
+class Settings:
+    """The settings window. Nothing changes until Save."""
+
+    def __init__(self, app):
+        self.app = app
+        cfg = app.cfg
+        w = self.win = tk.Toplevel(app.root, bg=BG, padx=30, pady=22)
+        w.title("SUPERCURSE")
+        w.resizable(False, False)
+        self.icon_image = ImageTk.PhotoImage(tray_image())  # kept on self, or Tk drops the image
+        w.iconphoto(False, self.icon_image)
+        w.protocol("WM_DELETE_WINDOW", self.close)
+        w.bind("<Escape>", lambda e: self.close())
+        w.bind("<Return>", lambda e: self.save())
+
+        head = tk.Frame(w, bg=BG)
+        head.pack(anchor="w")
+        tk.Label(head, text="SUPER", font=TITLE_FONT, fg=ACCENT, bg=BG, padx=0, bd=0).pack(side="left")
+        tk.Label(head, text="CURSE", font=TITLE_FONT, fg=FG, bg=BG, padx=0, bd=0).pack(side="left")
+        self.label(w, "Point at it. Hear it.", MUTED).pack(anchor="w")
+
+        body = self.section("HOTKEYS")
+        self.keys = {}
+        for row, (job, text) in enumerate((("selection", "Read selected text"), ("hover", "Read under the mouse"))):
+            self.label(body, text).grid(row=row, column=0, sticky="w", pady=5)
+            var = self.keys[f"{job}_hotkey"] = tk.StringVar(value=cfg[f"{job}_hotkey"].upper())
+            tk.Entry(body, textvariable=var, width=16, font=HEAD_FONT, justify="center", bg=PANEL, fg=FG,
+                     insertbackground=ACCENT, relief="flat", highlightthickness=1, highlightbackground=LINE,
+                     highlightcolor=ACCENT).grid(row=row, column=1, sticky="e", padx=(40, 0), ipady=5)
+        body.columnconfigure(0, weight=1)
+        self.label(body, "CTRL, ALT, SHIFT or WIN plus one key, like CTRL+ALT+E", MUTED, small=True).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        body = self.section("UNDER THE MOUSE")
+        self.label(body, "How much to read").pack(anchor="w")
+        self.unit = tk.StringVar(value=cfg["hover_unit"])
+        segments = tk.Frame(body, bg=BG)
+        segments.pack(anchor="w", pady=(6, 10))
+        for unit in UNITS:
+            tk.Radiobutton(segments, text=unit.upper(), value=unit, variable=self.unit, indicatoron=False,
+                           font=HEAD_FONT, bg=PANEL, fg=FG, selectcolor=ACCENT, activebackground=LINE,
+                           activeforeground=FG, relief="flat", bd=0, padx=14, pady=6, cursor="hand2",
+                           highlightthickness=0).pack(side="left", padx=(0, 2))
+        self.highlight = tk.BooleanVar(value=cfg["highlight"])
+        tk.Checkbutton(body, text="  Outline the text being read", variable=self.highlight, font=BODY_FONT, bg=BG,
+                       fg=FG, selectcolor=PANEL, activebackground=BG, activeforeground=FG, cursor="hand2",
+                       highlightthickness=0, bd=0).pack(anchor="w")
+
+        body = self.section("VOICE")
+        self.label(body, "SLOWER", MUTED, small=True).pack(side="left")
+        self.rate = tk.IntVar(value=cfg["rate"])
+        tk.Scale(body, variable=self.rate, from_=-10, to=10, orient="horizontal", showvalue=False, length=190,
+                 width=12, sliderlength=22, bg=ACCENT, troughcolor=PANEL, activebackground=ACCENT_HI, bd=0,
+                 highlightthickness=0, sliderrelief="flat", cursor="hand2").pack(side="left", padx=8)
+        self.label(body, "FASTER", MUTED, small=True).pack(side="left")
+        button(body, "▶  TEST", self.test).pack(side="right")
+
+        foot = tk.Frame(w, bg=BG)
+        foot.pack(fill="x", pady=(24, 0))
+        self.error = self.label(foot, "", ACCENT, small=True)
+        self.error.pack(side="left")
+        button(foot, "SAVE", self.save, primary=True).pack(side="right")
+        button(foot, "CANCEL", self.close).pack(side="right", padx=(0, 8))
+
+        w.update_idletasks()
+        dark_title_bar(w)
+        x, y = auto.GetCursorPos()  # open next to the tray, on the screen the mouse is on
+        w.geometry(f"+{max(0, x - w.winfo_reqwidth())}+{max(0, y - w.winfo_reqheight() - 60)}")
+
+    def label(self, parent, text, color=FG, small=False):
+        return tk.Label(parent, text=text, font=HEAD_FONT if small else BODY_FONT, fg=color, bg=BG)
+
+    def section(self, title):
+        tk.Label(self.win, text=title, font=HEAD_FONT, fg=ACCENT, bg=BG).pack(anchor="w", pady=(20, 2))
+        tk.Frame(self.win, height=1, bg=LINE).pack(fill="x", pady=(0, 8))
+        body = tk.Frame(self.win, bg=BG)
+        body.pack(fill="x")
+        return body
+
+    def test(self):
+        self.app.jobs.put(("say", "This is how I sound at this speed.", self.rate.get()))
+
+    def save(self):
+        new = {}
+        for key, var in self.keys.items():
+            combo = var.get().strip().lower()
+            try:
+                parse_hotkey(combo)
+            except ValueError as e:
+                self.error.config(text=str(e).upper())
+                return
+            new[key] = combo
+        if new["selection_hotkey"] == new["hover_hotkey"]:
+            self.error.config(text="THE TWO HOTKEYS MUST BE DIFFERENT")
+            return
+        hotkeys_changed = any(new[k] != self.app.cfg[k] for k in new)
+        new.update(hover_unit=self.unit.get(), highlight=self.highlight.get(), rate=self.rate.get())
+        self.app.cfg.update(new)
+        save_config(self.app.cfg)
+        self.app.icon.title = self.app.tooltip()
+        if hotkeys_changed:
+            self.app.reload_hotkeys()
+        self.close()
+
+    def close(self):
+        self.win.destroy()
+        self.app.settings = None
+
+
 class Overlay:
-    """A see-through yellow box shown briefly over the text being read. Click-through, never takes focus."""
+    """A neon outline shown for a second around the text being read. Click-through, never takes focus."""
+    KEY = "#010203"  # this colour is made fully see-through, leaving only the border
 
     def __init__(self, root):
         self.root = root
-        self.win = tk.Toplevel(root, bg="#ffd400")
+        self.win = tk.Toplevel(root, bg=ACCENT)
         self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True, "-alpha", 0.3)
+        self.win.attributes("-topmost", True, "-alpha", 0.9, "-transparentcolor", self.KEY)
+        tk.Frame(self.win, bg=self.KEY).pack(fill="both", expand=True, padx=3, pady=3)
         self.win.withdraw()
         root.update_idletasks()
         self.hwnd = int(self.win.wm_frame(), 16)
@@ -510,7 +698,7 @@ class Overlay:
         self.hide_job = None
 
     def show(self, rect):
-        pad = 3
+        pad = 5
         left, top, right, bottom = rect
         # shown with raw Win32 calls because Tk's own show/raise would activate the window and steal focus
         user32.SetWindowPos(self.hwnd, wt.HWND(-1), left - pad, top - pad, right - left + 2 * pad, bottom - top + 2 * pad,
@@ -518,14 +706,6 @@ class Overlay:
         if self.hide_job:
             self.root.after_cancel(self.hide_job)
         self.hide_job = self.root.after(1000, lambda: user32.ShowWindow(self.hwnd, 0))
-
-
-def tray_image():
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.ellipse((2, 2, 62, 62), fill=(40, 90, 200))
-    draw.polygon([(18, 24), (28, 24), (40, 14), (40, 50), (28, 40), (18, 40)], fill="white")  # speaker
-    return img
 
 
 if __name__ == "__main__":
