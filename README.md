@@ -9,7 +9,22 @@ A small Windows tray app that reads text aloud with the built-in Windows voice.
 
 Press either hotkey again while it is speaking to stop it. If it finds nothing to read, it plays a short low beep.
 
-## Setup
+## Sharing it (no Python needed)
+
+`build.bat` makes `dist\SUPERCURSE.exe`, a single 22 MB file. Send that file to anyone on Windows 10 or 11 and they double-click it; nothing to install. Their settings and log go in the same folder as the exe.
+
+The exe isn't code-signed, so the first time Windows shows "Windows protected your PC". Click **More info → Run anyway**. Some antivirus tools are wary of unsigned Python-built exes too.
+
+To build it yourself, set up the venv below, then:
+
+```bat
+.venv\Scripts\python -m pip install pyinstaller
+build.bat
+```
+
+The exe was tested with both hotkeys, stopping speech, the clipboard being put back, UI Automation in Notepad and OCR on a picture.
+
+## Setup (running from source)
 
 You need Python 3.12 (64-bit). Install it from python.org and tick "Add to PATH". Then, in this folder:
 

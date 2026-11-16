@@ -2,3 +2,7 @@
 __pycache__/
 config.json
 supercurse.log
+build/
+dist/
+*.spec
+icon.ico

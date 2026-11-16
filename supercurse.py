@@ -11,6 +11,7 @@ import json
 import logging
 import queue
 import re
+import sys
 import threading
 import time
 import tkinter as tk
@@ -22,7 +23,7 @@ import comtypes.client
 import pystray
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent  # exe build: keep config/log next to the exe
 CONFIG_PATH = HERE / "config.json"
 logging.basicConfig(filename=HERE / "supercurse.log", level=logging.WARNING, format="%(asctime)s %(message)s")
 log = logging.getLogger("supercurse")
